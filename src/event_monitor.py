@@ -1,6 +1,8 @@
+
 import csv
 import os
 import time
+import threading
 from datetime import datetime
 
 import cv2
@@ -17,10 +19,19 @@ from zone_utils import (
 )
 
 
+# Latest processed frame for browser streaming
+latest_frame = None
+frame_lock = threading.Lock()
+
+
+
 # ---------------- SETTINGS ----------------
 
 # Project root = the folder that contains src, weights, outputs
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STREAM_DIR = os.path.join(BASE_DIR, "stream")
+STREAM_FRAME = os.path.join(STREAM_DIR, "latest.jpg")
+os.makedirs(STREAM_DIR, exist_ok=True)
 
 MODEL_PATH = os.path.join(BASE_DIR, "weights", "yolo26n.pt")
 
@@ -175,6 +186,8 @@ def draw_alert(frame, text):
 # ---------------- MAIN ----------------
 
 def main():
+    global latest_frame
+
     is_webcam = isinstance(SOURCE, int)
 
     if not is_webcam and not os.path.exists(SOURCE):
@@ -218,8 +231,10 @@ def main():
         f"Repeated violation fires after {REPEAT_LIMIT} entries "
         f"within {REPEAT_WINDOW_SECONDS}s."
     )
-    print("To stop: click the video window and press Q or Esc, "
-          "or close the window.")
+    print(
+        "To stop: click the video window and press Q or Esc, "
+        "or close the window."
+    )
 
     while True:
         ret, frame = cap.read()
@@ -240,7 +255,9 @@ def main():
 
         if zones is None:
             zones = build_zones(ZONE_CONFIG, frame.shape)
-            restricted_names = {z["name"] for z in zones if z["restricted"]}
+            restricted_names = {
+                z["name"] for z in zones if z["restricted"]
+            }
             engine = EventEngine(
                 list(restricted_names),
                 DWELL_SECONDS,
@@ -271,9 +288,13 @@ def main():
                     continue
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                track_id = int(track_ids[i]) if track_ids is not None else -1
+                track_id = (
+                    int(track_ids[i]) if track_ids is not None else -1
+                )
 
-                foot_point = get_foot_point(x1, y1, x2, y2, frame_w, frame_h)
+                foot_point = get_foot_point(
+                    x1, y1, x2, y2, frame_w, frame_h
+                )
                 raw_zone = find_zone(foot_point, zones)
 
                 dwell = 0.0
@@ -283,7 +304,9 @@ def main():
 
                     state = track_states.get(track_id)
                     if state is None:
-                        state = new_track_state(object_type, confidence)
+                        state = new_track_state(
+                            object_type, confidence
+                        )
                         track_states[track_id] = state
 
                     state["missing"] = 0
@@ -291,19 +314,28 @@ def main():
                     state["conf"] = confidence
 
                     # Phase 3: confirm the zone (boundary stability)
-                    update_zone_state(state, raw_zone, CONFIRM_FRAMES)
+                    update_zone_state(
+                        state, raw_zone, CONFIRM_FRAMES
+                    )
                     current_zone = state["zone"]
 
                     # Phase 4: feed the confirmed zone to the event engine
                     new_events = engine.update(
-                        track_id, object_type, current_zone, confidence, now
+                        track_id,
+                        object_type,
+                        current_zone,
+                        confidence,
+                        now,
                     )
+
                     for event in new_events:
                         log_event(csv_file, csv_writer, event)
                         text = banner_text_for(event)
                         if text:
                             alert_text = text
-                            alert_until = frame_no + ALERT_FRAMES
+                            alert_until = (
+                                frame_no + ALERT_FRAMES
+                            )
 
                     dwell = engine.get_dwell(track_id, now)
                 else:
@@ -319,28 +351,59 @@ def main():
                     text_color = (0, 0, 0)
 
                 parts = []
+
                 if track_id != -1:
                     parts.append(f"{object_type} #{track_id}")
                 else:
                     parts.append(object_type)
+
                 parts.append(zone_label(current_zone))
+
                 if dwell > 0:
                     parts.append(f"{int(dwell)}s")
+
                 parts.append(f"{confidence:.2f}")
+
                 label = " | ".join(parts)
 
-                (text_w, _), _ = cv2.getTextSize(label, FONT, 0.6, 2)
+                (text_w, _), _ = cv2.getTextSize(
+                    label, FONT, 0.6, 2
+                )
                 top = max(y1 - 30, 0)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.rectangle(
-                    frame, (x1, top), (x1 + text_w + 10, top + 30), color, -1
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    color,
+                    2,
                 )
+
+                cv2.rectangle(
+                    frame,
+                    (x1, top),
+                    (x1 + text_w + 10, top + 30),
+                    color,
+                    -1,
+                )
+
                 cv2.putText(
-                    frame, label, (x1 + 5, top + 21),
-                    FONT, 0.6, text_color, 2
+                    frame,
+                    label,
+                    (x1 + 5, top + 21),
+                    FONT,
+                    0.6,
+                    text_color,
+                    2,
                 )
-                cv2.circle(frame, foot_point, 5, (255, 0, 0), -1)
+
+                cv2.circle(
+                    frame,
+                    foot_point,
+                    5,
+                    (255, 0, 0),
+                    -1,
+                )
 
         # Clean up tracks that disappeared (temporary loss is safe)
         for track_id in list(track_states.keys()):
@@ -353,11 +416,22 @@ def main():
             if state["missing"] > MAX_MISSING_FRAMES:
                 for event in engine.remove_track(track_id, now):
                     log_event(csv_file, csv_writer, event)
+
                 del track_states[track_id]
 
         if frame_no <= alert_until:
             draw_alert(frame, alert_text)
 
+        # ---------------------------------------------------------
+        # SHARE THE FINAL PROCESSED FRAME WITH FASTAPI
+        # ---------------------------------------------------------
+        with frame_lock:
+            latest_frame = frame.copy()
+
+        # Existing OpenCV desktop display
+        stream_frame = cv2.resize(frame, (960, 540))
+        cv2.imwrite(STREAM_FRAME, stream_frame,
+    [cv2.IMWRITE_JPEG_QUALITY, 70],)
         cv2.imshow(window_name, frame)
 
         # Stop keys: q, Q (Caps Lock safe) or Esc
@@ -366,12 +440,19 @@ def main():
             break
 
         # Stop when the window is closed with the X button
-        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty(
+            window_name, cv2.WND_PROP_VISIBLE
+        ) < 1:
             break
 
     cap.release()
     csv_file.close()
     cv2.destroyAllWindows()
+
+    # Clear the shared frame when the event engine stops
+    with frame_lock:
+        latest_frame = None
+
     print("Event engine stopped.")
 
 
